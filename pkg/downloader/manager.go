@@ -74,7 +74,7 @@ type Manager struct {
 	RegistryClient   *registry.Client
 	RepositoryConfig string
 	RepositoryCache  string
-	Repos            *ChartRepositories
+	repos            *ChartRepositories
 }
 
 // Build rebuilds a local charts directory from a lockfile.
@@ -83,9 +83,6 @@ type Manager struct {
 //
 // If SkipUpdate is set, this will not update the repository.
 func (m *Manager) Build() error {
-	if err := m.loadChartRepositories(); err != nil {
-		return err
-	}
 	c, err := m.loadChartDir()
 	if err != nil {
 		return err
@@ -153,7 +150,8 @@ func (m *Manager) Build() error {
 // negotiate versions based on that. It will download the versions
 // from remote chart repositories unless SkipUpdate is true.
 func (m *Manager) Update() error {
-	if err := m.loadChartRepositories(); err != nil {
+	repos, err := m.Repos()
+	if err != nil {
 		return err
 	}
 	c, err := m.loadChartDir()
@@ -178,7 +176,7 @@ func (m *Manager) Update() error {
 
 	// Now we need to find out which version of a chart best satisfies the
 	// dependencies in the Chart.yaml
-	lock, urls, err := m.resolve(req, m.Repos.GetForDeps(req))
+	lock, urls, err := m.resolve(req, repos.GetForDeps(req))
 	if err != nil {
 		return err
 	}
@@ -227,7 +225,8 @@ func (m *Manager) resolve(req []*chart.Dependency, repoNames map[string]string) 
 // It will delete versions of the chart that exist on disk and might cause
 // a conflict.
 func (m *Manager) downloadAll(deps []*chart.Dependency, urls map[string]string) error {
-	if err := m.loadChartRepositories(); err != nil {
+	repos, err := m.Repos()
+	if err != nil {
 		return err
 	}
 
@@ -312,18 +311,20 @@ func (m *Manager) downloadAll(deps []*chart.Dependency, urls map[string]string) 
 		fmt.Fprintf(m.Out, "Downloading %s from repo %s\n", dep.Name, dep.Repository)
 
 		dl := ChartDownloader{
-			Out:            m.Out,
-			Verify:         m.Verify,
-			Keyring:        m.Keyring,
-			Repos:          m.Repos,
-			RegistryClient: m.RegistryClient,
-			Getters:        m.Getters,
+			Out:              m.Out,
+			Verify:           m.Verify,
+			Keyring:          m.Keyring,
+			RepositoryConfig: m.RepositoryConfig,
+			RepositoryCache:  m.RepositoryCache,
+			RegistryClient:   m.RegistryClient,
+			Getters:          m.Getters,
 			Options: []getter.Option{
 				getter.WithBasicAuth(username, password),
 				getter.WithPassCredentialsAll(passcredentialsall),
 				getter.WithInsecureSkipVerifyTLS(insecureskiptlsverify),
 				getter.WithTLSClientConfig(certFile, keyFile, caFile),
 			},
+			repos: repos,
 		}
 
 		version := ""
@@ -337,7 +338,7 @@ func (m *Manager) downloadAll(deps []*chart.Dependency, urls map[string]string) 
 				getter.WithTagName(version))
 		}
 
-		if _, _, err = dl.DownloadToPreloaded(churl, m.Repos.CanonicalizeRepoName(dep.Repository), version, tmpPath); err != nil {
+		if _, _, err = dl.DownloadToPreloaded(churl, repos.CanonicalizeRepoName(dep.Repository), version, tmpPath); err != nil {
 			saveError = errors.Wrapf(err, "could not download %s", churl)
 			break
 		}
@@ -589,6 +590,10 @@ repository, use "https://charts.example.com/" or "@example" instead of
 }
 
 func (m *Manager) resolveRepoName(dd *chart.Dependency) (string, string, error) {
+	repos, err := m.Repos()
+	if err != nil {
+		return "", "", err
+	}
 	// Verify that all repositories referenced in the deps are actually known
 	// by Helm.
 	if dd.Repository != "" {
@@ -607,8 +612,8 @@ func (m *Manager) resolveRepoName(dd *chart.Dependency) (string, string, error) 
 		if registry.IsOCI(dd.Repository) {
 			return dd.Name, dd.Repository, nil
 		}
-		for _, repoName := range m.Repos.Keys() {
-			info := m.Repos.GetInfo(repoName)
+		for _, repoName := range repos.Keys() {
+			info := repos.GetInfo(repoName)
 			if (strings.HasPrefix(dd.Repository, "@") && strings.TrimPrefix(dd.Repository, "@") == repoName) ||
 				(strings.HasPrefix(dd.Repository, "alias:") && strings.TrimPrefix(dd.Repository, "alias:") == repoName) {
 				dd.Repository = info.URL
@@ -690,12 +695,17 @@ func (m *Manager) parallelRepoUpdate(repos []*repo.Entry) error {
 //
 // If it finds a URL that is "relative", it will prepend the repoURL.
 func (m *Manager) findChartURL(name, version, repoURL string, urls map[string]string) (url, username, password string, insecureskiptlsverify, passcredentialsall bool, caFile, certFile, keyFile string, err error) {
+	var repos *ChartRepositories
+	repos, err = m.Repos()
+	if err != nil {
+		return
+	}
 	if registry.IsOCI(repoURL) {
 		return fmt.Sprintf("%s/%s:%s", repoURL, name, version), "", "", false, false, "", "", "", nil
 	}
-	if cr := m.Repos.GetInfoByURL(repoURL); cr != nil {
+	if cr := repos.GetInfoByURL(repoURL); cr != nil {
 		var index *repo.IndexFile
-		index, err = m.Repos.GetIndex(cr.Name)
+		index, err = repos.GetIndex(cr.Name)
 		if err != nil {
 			return
 		}
@@ -794,16 +804,16 @@ func normalizeURL(baseURL, urlOrPath string) (string, error) {
 	return u2.String(), nil
 }
 
-func (m *Manager) loadChartRepositories() error {
-	if m.Repos != nil {
-		return nil
+func (m *Manager) Repos() (*ChartRepositories, error) {
+	if m.repos != nil {
+		return m.repos, nil
 	}
 	repos, err := NewChartRepositories(m.RepositoryConfig, m.RepositoryCache)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	m.Repos = repos
-	return nil
+	m.repos = repos
+	return repos, nil
 }
 
 // writeLock writes a lockfile to disk

@@ -67,9 +67,23 @@ type ChartDownloader struct {
 	// Getter collection for the operation
 	Getters getter.Providers
 	// Options provide parameters to be passed along to the Getter being initialized.
-	Options        []getter.Option
-	RegistryClient *registry.Client
-	Repos          *ChartRepositories
+	Options          []getter.Option
+	RegistryClient   *registry.Client
+	RepositoryConfig string
+	RepositoryCache  string
+	repos            *ChartRepositories
+}
+
+func (c *ChartDownloader) Repos() (*ChartRepositories, error) {
+	if c.repos != nil {
+		return c.repos, nil
+	}
+	r, err := NewChartRepositories(c.RepositoryConfig, c.RepositoryCache)
+	if err != nil {
+		return nil, err
+	}
+	c.repos = r
+	return c.repos, nil
 }
 
 // DownloadTo retrieves a chart. Depending on the settings, it may also download a provenance file.
@@ -84,7 +98,11 @@ type ChartDownloader struct {
 // Returns a string path to the location where the file was downloaded and a verification
 // (if provenance was verified), or an error if something bad happened.
 func (c *ChartDownloader) DownloadTo(ref, version, dest string) (string, *provenance.Verification, error) {
-	return c.DownloadToPreloaded(ref, c.Repos.GetForRef(ref), version, dest)
+	r, err := c.Repos()
+	if err != nil {
+		return "", nil, err
+	}
+	return c.DownloadToPreloaded(ref, r.GetForRef(ref), version, dest)
 }
 func (c *ChartDownloader) DownloadToPreloaded(ref, repoName, version, dest string) (string, *provenance.Verification, error) {
 	u, err := c.ResolveChartVersion(ref, repoName, version)
@@ -198,7 +216,11 @@ func (c *ChartDownloader) ResolveChartVersion(ref string, repoName string, versi
 	if registry.IsOCI(u.String()) {
 		return c.getOciURI(ref, version, u)
 	}
-	rc := c.Repos.GetInfo(repoName)
+	repos, err := c.Repos()
+	if err != nil {
+		return nil, err
+	}
+	rc := repos.GetInfo(repoName)
 
 	if u.IsAbs() && len(u.Host) > 0 && len(u.Path) > 0 {
 		// In this case, we have to find the parent repo that contains this chart
@@ -265,7 +287,7 @@ func (c *ChartDownloader) ResolveChartVersion(ref string, repoName string, versi
 	}
 
 	// Next, we need to load the index, and actually look up the chart.
-	i, err := c.Repos.GetIndex(r.Config.Name)
+	i, err := repos.GetIndex(r.Config.Name)
 	if err != nil {
 		return u, errors.Wrap(err, "no cached repo found. (try 'helm repo update')")
 	}

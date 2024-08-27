@@ -761,10 +761,6 @@ func (c *ChartPathOptions) LocateChart(name string, settings *cli.EnvSettings) (
 		return name, errors.Errorf("path %q not found", name)
 	}
 
-	repos, err := downloader.NewChartRepositories(settings.RepositoryConfig, settings.RepositoryCache)
-	if err != nil {
-		return "", err
-	}
 	dl := downloader.ChartDownloader{
 		Out:     os.Stdout,
 		Keyring: c.Keyring,
@@ -775,8 +771,9 @@ func (c *ChartPathOptions) LocateChart(name string, settings *cli.EnvSettings) (
 			getter.WithInsecureSkipVerifyTLS(c.InsecureSkipTLSverify),
 			getter.WithPlainHTTP(c.PlainHTTP),
 		},
-		Repos:          repos,
-		RegistryClient: c.registryClient,
+		RepositoryConfig: settings.RepositoryConfig,
+		RepositoryCache:  settings.RepositoryCache,
+		RegistryClient:   c.registryClient,
 	}
 
 	if registry.IsOCI(name) {

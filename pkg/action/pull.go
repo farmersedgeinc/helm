@@ -80,10 +80,6 @@ func (p *Pull) SetRegistryClient(client *registry.Client) {
 func (p *Pull) Run(chartRef string) (string, error) {
 	var out strings.Builder
 
-	repos, err := downloader.NewChartRepositories(p.Settings.RepositoryConfig, p.Settings.RepositoryCache)
-	if err != nil {
-		return "", err
-	}
 	c := downloader.ChartDownloader{
 		Out:     &out,
 		Keyring: p.Keyring,
@@ -96,8 +92,9 @@ func (p *Pull) Run(chartRef string) (string, error) {
 			getter.WithInsecureSkipVerifyTLS(p.InsecureSkipTLSverify),
 			getter.WithPlainHTTP(p.PlainHTTP),
 		},
-		RegistryClient: p.cfg.RegistryClient,
-		Repos:          repos,
+		RegistryClient:   p.cfg.RegistryClient,
+		RepositoryConfig: p.Settings.RepositoryConfig,
+		RepositoryCache:  p.Settings.RepositoryCache,
 	}
 
 	if registry.IsOCI(chartRef) {
