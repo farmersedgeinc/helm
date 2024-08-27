@@ -23,6 +23,23 @@ type ChartRepositories struct {
 	reposM    sync.RWMutex
 }
 
+func NewChartRepositories(repoConfigPath, repoCachePath string) (*ChartRepositories, error) {
+	repoFile, err := loadRepoConfig(repoConfigPath)
+	if err != nil {
+		return nil, err
+	}
+
+	repos := make(map[string]*repo.Entry, len(repoFile.Repositories))
+	for _, entry := range repoFile.Repositories {
+		repos[entry.Name] = entry
+	}
+	return &ChartRepositories{
+		repos:     repos,
+		indexPath: repoCachePath,
+		indices:   map[string]*repo.IndexFile{},
+	}, nil
+}
+
 func (c *ChartRepositories) GetIndex(name string) (*repo.IndexFile, error) {
 	if name == "" {
 		return nil, nil
@@ -73,23 +90,12 @@ func (c *ChartRepositories) getInfoByF(f func(*repo.Entry) bool) *repo.Entry {
 	return nil
 }
 
-func (c *ChartRepositories) GetKeysByF(f func(*repo.Entry) bool) []string {
-	c.reposM.RLock()
-	defer c.reposM.RUnlock()
-	result := []string{}
-	for _, entry := range c.repos {
-		if f(entry) {
-			result = append(result, entry.Name)
-		}
-	}
-	return result
-}
-
 func (c *ChartRepositories) GetInfoByURL(url string) *repo.Entry {
 	c.reposM.Lock()
 	defer c.reposM.Unlock()
 	return c.getInfoByURL(url)
 }
+
 func (c *ChartRepositories) getInfoByURL(url string) *repo.Entry {
 	if entry := c.getInfoByF(func(entry *repo.Entry) bool {
 		return urlutil.Equal(entry.URL, url)
@@ -108,23 +114,6 @@ func (c *ChartRepositories) getInfoByURL(url string) *repo.Entry {
 	}
 	c.repos[generatedName] = generatedRepo
 	return generatedRepo
-}
-
-func NewChartRepositories(repoConfigPath, repoCachePath string) (*ChartRepositories, error) {
-	repoFile, err := loadRepoConfig(repoConfigPath)
-	if err != nil {
-		return nil, err
-	}
-
-	repos := make(map[string]*repo.Entry, len(repoFile.Repositories))
-	for _, entry := range repoFile.Repositories {
-		repos[entry.Name] = entry
-	}
-	return &ChartRepositories{
-		repos:     repos,
-		indexPath: repoCachePath,
-		indices:   map[string]*repo.IndexFile{},
-	}, nil
 }
 
 // GetForDep returns a Key corresponding to the Repository config for a given

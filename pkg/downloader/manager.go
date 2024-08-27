@@ -711,44 +711,6 @@ func (m *Manager) findChartURL(name, version, repoURL string, urls map[string]st
 	return url, username, password, false, false, "", "", "", err
 }
 
-// findEntryByName finds an entry in the chart repository whose name matches the given name.
-//
-// It returns the ChartVersions for that entry.
-// TODO factor out
-func findEntryByName(name string, index *repo.IndexFile) (repo.ChartVersions, error) {
-	return index.GetVersions(name)
-}
-
-// findVersionedEntry takes a ChartVersions list and returns a single chart version that satisfies the version constraints.
-//
-// If version is empty, the first chart found is returned.
-func findVersionedEntry(version string, vers repo.ChartVersions) (*repo.ChartVersion, error) {
-	for _, verEntry := range vers {
-		if len(verEntry.URLs) == 0 {
-			// Not a legit entry.
-			continue
-		}
-
-		if version == "" || versionEquals(version, verEntry.Version) {
-			return verEntry, nil
-		}
-	}
-	return nil, errors.New("no matching version")
-}
-
-func versionEquals(v1, v2 string) bool {
-	sv1, err := semver.NewVersion(v1)
-	if err != nil {
-		// Fallback to string comparison.
-		return v1 == v2
-	}
-	sv2, err := semver.NewVersion(v2)
-	if err != nil {
-		return false
-	}
-	return sv1.Equal(sv2)
-}
-
 func normalizeURL(baseURL, urlOrPath string) (string, error) {
 	u, err := url.Parse(urlOrPath)
 	if err != nil {

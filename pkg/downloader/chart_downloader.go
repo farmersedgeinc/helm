@@ -346,17 +346,6 @@ func isTar(filename string) bool {
 	return strings.EqualFold(filepath.Ext(filename), ".tgz")
 }
 
-func pickChartRepositoryConfigByName(repos *ChartRepositories, name string) (*repo.Entry, error) {
-	rc := repos.GetInfo(name)
-	if rc == nil {
-		return nil, errors.Errorf("repo %s not found", name)
-	}
-	if rc.URL == "" {
-		return nil, errors.Errorf("no URL found for repository %s", name)
-	}
-	return rc, nil
-}
-
 func loadRepoConfig(file string) (*repo.File, error) {
 	r, err := repo.LoadFile(file)
 	if err != nil && !os.IsNotExist(errors.Cause(err)) {
