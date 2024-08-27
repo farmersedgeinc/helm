@@ -166,6 +166,10 @@ func (m *Manager) Update() error {
 		return nil
 	}
 
+	if err := m.ensureMissingRepos(req); err != nil {
+		return err
+	}
+
 	// For each of the repositories Helm is configured to know about, update
 	// the index information locally.
 	if !m.SkipUpdate {
@@ -483,70 +487,30 @@ Loop:
 // to work with along with the chart dependencies. It will find the deps not
 // in a known repo and attempt to ensure the data is present for steps like
 // version resolution.
-func (m *Manager) ensureMissingRepos(repoNames map[string]string, deps []*chart.Dependency) (map[string]string, error) {
-
-	var ru []*repo.Entry
-
-Outer:
-	for _, dd := range deps {
-
-		// If the chart is in the local charts directory no repository needs
-		// to be specified.
-		if dd.Repository == "" {
-			continue
-		}
-
-		// When the repoName for a dependency is known we can skip ensuring
-		if _, ok := repoNames[dd.Name]; ok {
-			continue
-		}
-
-		// The generated repository name, which will result in an index being
-		// locally cached, has a name pattern of "helm-manager-" followed by a
-		// sha256 of the repo name. This assumes end users will never create
-		// repositories with these names pointing to other repositories. Using
-		// this method of naming allows the existing repository pulling and
-		// resolution code to do most of the work.
-		rn, err := key(dd.Repository)
-		if err != nil {
-			return repoNames, err
-		}
-		rn = managerKeyPrefix + rn
-
-		repoNames[dd.Name] = rn
-
-		// If repository is already present don't add to array. This will skip
-		// unnecessary index file downloading improving performance.
-		for _, item := range ru {
-			if item.URL == dd.Repository {
-				continue Outer
-			}
-		}
-
-		// Assuming the repository is generally available. For Helm managed
-		// access controls the repository needs to be added through the user
-		// managed system. This path will work for public charts, like those
-		// supplied by Bitnami, but not for protected charts, like corp ones
-		// behind a username and pass.
-		ri := &repo.Entry{
-			Name: rn,
-			URL:  dd.Repository,
-		}
-		ru = append(ru, ri)
-	}
-
+func (m *Manager) ensureMissingRepos(deps []*chart.Dependency) error {
 	// Calls to UpdateRepositories (a public function) will only update
 	// repositories configured by the user. Here we update repos found in
 	// the dependencies that are not known to the user if update skipping
 	// is not configured.
+	repos, err := m.Repos()
+	if err != nil {
+		return err
+	}
+	ru := []*repo.Entry{}
+	for _, dep := range deps {
+		entry := repos.GetInfo(repos.CanonicalizeRepoName(dep.Repository))
+		if entry != nil && isRepoNameGenerated(entry.Name) {
+			ru = append(ru, entry)
+		}
+	}
 	if !m.SkipUpdate && len(ru) > 0 {
 		fmt.Fprintln(m.Out, "Getting updates for unmanaged Helm repositories...")
 		if err := m.parallelRepoUpdate(ru); err != nil {
-			return repoNames, err
+			return err
 		}
 	}
 
-	return repoNames, nil
+	return nil
 }
 
 // resolveRepoNames returns the repo names of the referenced deps which can be used to fetch the cached index file
@@ -651,7 +615,6 @@ func (m *Manager) UpdateRepositories() error {
 }
 
 func (m *Manager) parallelRepoUpdate(repos []*repo.Entry) error {
-
 	var wg sync.WaitGroup
 	for _, c := range repos {
 		r, err := repo.NewChartRepository(c, m.Getters)
@@ -866,6 +829,10 @@ func tarFromLocalDir(chartpath, name, repo, version, destPath string) (string, e
 
 // The prefix to use for cache keys created by the manager for repo names
 const managerKeyPrefix = "helm-manager-"
+
+func isRepoNameGenerated(name string) bool {
+	return strings.HasPrefix(name, managerKeyPrefix)
+}
 
 // key is used to turn a name, such as a repository url, into a filesystem
 // safe name that is unique for querying. To accomplish this a unique hash of
