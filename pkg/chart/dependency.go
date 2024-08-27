@@ -15,7 +15,9 @@ limitations under the License.
 
 package chart
 
-import "time"
+import (
+	"time"
+)
 
 // Dependency describes a chart upon which another chart depends.
 //

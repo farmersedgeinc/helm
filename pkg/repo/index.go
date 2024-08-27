@@ -78,6 +78,40 @@ func (c ChartVersions) Less(a, b int) bool {
 	return i.LessThan(j)
 }
 
+func (c ChartVersions) Get(name, version string) (*ChartVersion, error) {
+	var constraint *semver.Constraints
+	if version == "" {
+		constraint, _ = semver.NewConstraint("*")
+	} else {
+		var err error
+		constraint, err = semver.NewConstraint(version)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// when customer input exact version, check whether have exact match one first
+	if len(version) != 0 {
+		for _, ver := range c {
+			if version == ver.Version {
+				return ver, nil
+			}
+		}
+	}
+
+	for _, ver := range c {
+		test, err := semver.NewVersion(ver.Version)
+		if err != nil {
+			continue
+		}
+
+		if constraint.Check(test) {
+			return ver, nil
+		}
+	}
+	return nil, errors.Errorf("no chart version found for %s-%s", name, version)
+}
+
 // IndexFile represents the index file in a chart repository
 type IndexFile struct {
 	// This is used ONLY for validation against chartmuseum's index files and is discarded after validation.
@@ -181,45 +215,22 @@ func (i IndexFile) SortEntries() {
 // If version is empty, this will return the chart with the latest stable version,
 // prerelease versions will be skipped.
 func (i IndexFile) Get(name, version string) (*ChartVersion, error) {
-	vs, ok := i.Entries[name]
+	vs, err := i.GetVersions(name)
+	if err != nil {
+		return nil, err
+	}
+	return vs.Get(name, version)
+}
+
+func (i IndexFile) GetVersions(name string) (ChartVersions, error) {
+	versions, ok := i.Entries[name]
 	if !ok {
 		return nil, ErrNoChartName
 	}
-	if len(vs) == 0 {
+	if len(versions) == 0 {
 		return nil, ErrNoChartVersion
 	}
-
-	var constraint *semver.Constraints
-	if version == "" {
-		constraint, _ = semver.NewConstraint("*")
-	} else {
-		var err error
-		constraint, err = semver.NewConstraint(version)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// when customer input exact version, check whether have exact match one first
-	if len(version) != 0 {
-		for _, ver := range vs {
-			if version == ver.Version {
-				return ver, nil
-			}
-		}
-	}
-
-	for _, ver := range vs {
-		test, err := semver.NewVersion(ver.Version)
-		if err != nil {
-			continue
-		}
-
-		if constraint.Check(test) {
-			return ver, nil
-		}
-	}
-	return nil, errors.Errorf("no chart version found for %s-%s", name, version)
+	return versions, nil
 }
 
 // WriteFile writes an index file to the given destination path.

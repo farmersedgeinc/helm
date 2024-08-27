@@ -40,7 +40,6 @@ import (
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/getter"
-	"helm.sh/helm/v3/pkg/helmpath"
 	"helm.sh/helm/v3/pkg/registry"
 	"helm.sh/helm/v3/pkg/repo"
 )
@@ -75,6 +74,7 @@ type Manager struct {
 	RegistryClient   *registry.Client
 	RepositoryConfig string
 	RepositoryCache  string
+	Repos            *ChartRepositories
 }
 
 // Build rebuilds a local charts directory from a lockfile.
@@ -83,6 +83,9 @@ type Manager struct {
 //
 // If SkipUpdate is set, this will not update the repository.
 func (m *Manager) Build() error {
+	if err := m.loadChartRepositories(); err != nil {
+		return err
+	}
 	c, err := m.loadChartDir()
 	if err != nil {
 		return err
@@ -150,6 +153,9 @@ func (m *Manager) Build() error {
 // negotiate versions based on that. It will download the versions
 // from remote chart repositories unless SkipUpdate is true.
 func (m *Manager) Update() error {
+	if err := m.loadChartRepositories(); err != nil {
+		return err
+	}
 	c, err := m.loadChartDir()
 	if err != nil {
 		return err
@@ -162,25 +168,6 @@ func (m *Manager) Update() error {
 		return nil
 	}
 
-	// Get the names of the repositories the dependencies need that Helm is
-	// configured to know about.
-	repoNames, err := m.resolveRepoNames(req)
-	if err != nil {
-		return err
-	}
-
-	// For the repositories Helm is not configured to know about, ensure Helm
-	// has some information about them and, when possible, the index files
-	// locally.
-	// TODO(mattfarina): Repositories should be explicitly added by end users
-	// rather than automattic. In Helm v4 require users to add repositories. They
-	// should have to add them in order to make sure they are aware of the
-	// repositories and opt-in to any locations, for security.
-	repoNames, err = m.ensureMissingRepos(repoNames, req)
-	if err != nil {
-		return err
-	}
-
 	// For each of the repositories Helm is configured to know about, update
 	// the index information locally.
 	if !m.SkipUpdate {
@@ -191,7 +178,7 @@ func (m *Manager) Update() error {
 
 	// Now we need to find out which version of a chart best satisfies the
 	// dependencies in the Chart.yaml
-	lock, urls, err := m.resolve(req, repoNames)
+	lock, urls, err := m.resolve(req, m.Repos.GetForDeps(req))
 	if err != nil {
 		return err
 	}
@@ -240,8 +227,7 @@ func (m *Manager) resolve(req []*chart.Dependency, repoNames map[string]string) 
 // It will delete versions of the chart that exist on disk and might cause
 // a conflict.
 func (m *Manager) downloadAll(deps []*chart.Dependency, urls map[string]string) error {
-	repos, err := m.loadChartRepositories()
-	if err != nil {
+	if err := m.loadChartRepositories(); err != nil {
 		return err
 	}
 
@@ -312,7 +298,7 @@ func (m *Manager) downloadAll(deps []*chart.Dependency, urls map[string]string) 
 
 		// Any failure to resolve/download a chart should fail:
 		// https://github.com/helm/helm/issues/1439
-		churl, username, password, insecureskiptlsverify, passcredentialsall, caFile, certFile, keyFile, err := m.findChartURL(dep.Name, dep.Version, dep.Repository, repos, urls)
+		churl, username, password, insecureskiptlsverify, passcredentialsall, caFile, certFile, keyFile, err := m.findChartURL(dep.Name, dep.Version, dep.Repository, urls)
 		if err != nil {
 			saveError = errors.Wrapf(err, "could not find %s", churl)
 			break
@@ -326,13 +312,12 @@ func (m *Manager) downloadAll(deps []*chart.Dependency, urls map[string]string) 
 		fmt.Fprintf(m.Out, "Downloading %s from repo %s\n", dep.Name, dep.Repository)
 
 		dl := ChartDownloader{
-			Out:              m.Out,
-			Verify:           m.Verify,
-			Keyring:          m.Keyring,
-			RepositoryConfig: m.RepositoryConfig,
-			RepositoryCache:  m.RepositoryCache,
-			RegistryClient:   m.RegistryClient,
-			Getters:          m.Getters,
+			Out:            m.Out,
+			Verify:         m.Verify,
+			Keyring:        m.Keyring,
+			Repos:          m.Repos,
+			RegistryClient: m.RegistryClient,
+			Getters:        m.Getters,
 			Options: []getter.Option{
 				getter.WithBasicAuth(username, password),
 				getter.WithPassCredentialsAll(passcredentialsall),
@@ -352,7 +337,7 @@ func (m *Manager) downloadAll(deps []*chart.Dependency, urls map[string]string) 
 				getter.WithTagName(version))
 		}
 
-		if _, _, err = dl.DownloadTo(churl, version, tmpPath); err != nil {
+		if _, _, err = dl.DownloadToPreloaded(churl, m.Repos.CanonicalizeRepoName(dep.Repository), version, tmpPath); err != nil {
 			saveError = errors.Wrapf(err, "could not download %s", churl)
 			break
 		}
@@ -566,88 +551,80 @@ Outer:
 // resolveRepoNames returns the repo names of the referenced deps which can be used to fetch the cached index file
 // and replaces aliased repository URLs into resolved URLs in dependencies.
 func (m *Manager) resolveRepoNames(deps []*chart.Dependency) (map[string]string, error) {
-	rf, err := loadRepoConfig(m.RepositoryConfig)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return make(map[string]string), nil
+	result := map[string]string{}
+	missing := []string{}
+	for _, dep := range deps {
+		if k, v, err := m.resolveRepoName(dep); err != nil {
+			return result, err
+		} else if k != "" {
+			result[k] = v
+		} else {
+			missing = append(missing, dep.Name)
 		}
-		return nil, err
 	}
-	repos := rf.Repositories
+	return result, missingReposError(missing)
+}
 
-	reposMap := make(map[string]string)
+func missingReposError(missing []string) error {
+	if len(missing) == 0 {
+		return nil
+	}
+	errorMessage := fmt.Sprintf("no repository definition for %s. Please add them via 'helm repo add'", strings.Join(missing, ", "))
+	// It is common for people to try to enter "stable" as a repository instead of the actual URL.
+	// For this case, let's give them a suggestion.
+	containsNonURL := false
+	for _, repo := range missing {
+		if !strings.Contains(repo, "//") && !strings.HasPrefix(repo, "@") && !strings.HasPrefix(repo, "alias:") {
+			containsNonURL = true
+		}
+	}
+	if containsNonURL {
+		errorMessage += `
+Note that repositories must be URLs or aliases. For example, to refer to the "example"
+repository, use "https://charts.example.com/" or "@example" instead of
+"example". Don't forget to add the repo, too ('helm repo add').`
+	}
+	return errors.New(errorMessage)
 
+}
+
+func (m *Manager) resolveRepoName(dd *chart.Dependency) (string, string, error) {
 	// Verify that all repositories referenced in the deps are actually known
 	// by Helm.
-	missing := []string{}
-	for _, dd := range deps {
-		// Don't map the repository, we don't need to download chart from charts directory
-		if dd.Repository == "" {
-			continue
-		}
+	if dd.Repository != "" {
 		// if dep chart is from local path, verify the path is valid
 		if strings.HasPrefix(dd.Repository, "file://") {
 			if _, err := resolver.GetLocalPath(dd.Repository, m.ChartPath); err != nil {
-				return nil, err
+				return "", "", err
 			}
 
 			if m.Debug {
 				fmt.Fprintf(m.Out, "Repository from local path: %s\n", dd.Repository)
 			}
-			reposMap[dd.Name] = dd.Repository
-			continue
+			return dd.Name, dd.Repository, nil
 		}
 
 		if registry.IsOCI(dd.Repository) {
-			reposMap[dd.Name] = dd.Repository
-			continue
+			return dd.Name, dd.Repository, nil
 		}
-
-		found := false
-
-		for _, repo := range repos {
-			if (strings.HasPrefix(dd.Repository, "@") && strings.TrimPrefix(dd.Repository, "@") == repo.Name) ||
-				(strings.HasPrefix(dd.Repository, "alias:") && strings.TrimPrefix(dd.Repository, "alias:") == repo.Name) {
-				found = true
-				dd.Repository = repo.URL
-				reposMap[dd.Name] = repo.Name
-				break
-			} else if urlutil.Equal(repo.URL, dd.Repository) {
-				found = true
-				reposMap[dd.Name] = repo.Name
+		for _, repoName := range m.Repos.Keys() {
+			info := m.Repos.GetInfo(repoName)
+			if (strings.HasPrefix(dd.Repository, "@") && strings.TrimPrefix(dd.Repository, "@") == repoName) ||
+				(strings.HasPrefix(dd.Repository, "alias:") && strings.TrimPrefix(dd.Repository, "alias:") == repoName) {
+				dd.Repository = info.URL
+				return dd.Name, info.Name, nil
+			} else if urlutil.Equal(info.URL, dd.Repository) {
+				return dd.Name, info.Name, nil
 				break
 			}
 		}
-		if !found {
-			repository := dd.Repository
-			// Add if URL
-			_, err := url.ParseRequestURI(repository)
-			if err == nil {
-				reposMap[repository] = repository
-				continue
-			}
-			missing = append(missing, repository)
+		// Add if URL
+		_, err := url.ParseRequestURI(dd.Repository)
+		if err == nil {
+			return dd.Repository, dd.Repository, nil
 		}
 	}
-	if len(missing) > 0 {
-		errorMessage := fmt.Sprintf("no repository definition for %s. Please add them via 'helm repo add'", strings.Join(missing, ", "))
-		// It is common for people to try to enter "stable" as a repository instead of the actual URL.
-		// For this case, let's give them a suggestion.
-		containsNonURL := false
-		for _, repo := range missing {
-			if !strings.Contains(repo, "//") && !strings.HasPrefix(repo, "@") && !strings.HasPrefix(repo, "alias:") {
-				containsNonURL = true
-			}
-		}
-		if containsNonURL {
-			errorMessage += `
-Note that repositories must be URLs or aliases. For example, to refer to the "example"
-repository, use "https://charts.example.com/" or "@example" instead of
-"example". Don't forget to add the repo, too ('helm repo add').`
-		}
-		return nil, errors.New(errorMessage)
-	}
-	return reposMap, nil
+	return "", "", nil
 }
 
 // UpdateRepositories updates all of the local repos to the latest.
@@ -712,44 +689,39 @@ func (m *Manager) parallelRepoUpdate(repos []*repo.Entry) error {
 // repoURL is the repository to search
 //
 // If it finds a URL that is "relative", it will prepend the repoURL.
-func (m *Manager) findChartURL(name, version, repoURL string, repos map[string]*repo.ChartRepository, urls map[string]string) (url, username, password string, insecureskiptlsverify, passcredentialsall bool, caFile, certFile, keyFile string, err error) {
+func (m *Manager) findChartURL(name, version, repoURL string, urls map[string]string) (url, username, password string, insecureskiptlsverify, passcredentialsall bool, caFile, certFile, keyFile string, err error) {
 	if registry.IsOCI(repoURL) {
 		return fmt.Sprintf("%s/%s:%s", repoURL, name, version), "", "", false, false, "", "", "", nil
 	}
-
-	for _, cr := range repos {
-
-		if urlutil.Equal(repoURL, cr.Config.URL) {
-			var entry repo.ChartVersions
-			entry, err = findEntryByName(name, cr)
-			if err != nil {
-				// TODO: Where linting is skipped in this function we should
-				// refactor to remove naked returns while ensuring the same
-				// behavior
-				//nolint:nakedret
-				return
-			}
-			var ve *repo.ChartVersion
-			ve, err = findVersionedEntry(version, entry)
-			if err != nil {
-				//nolint:nakedret
-				return
-			}
-			url, err = normalizeURL(repoURL, ve.URLs[0])
-			if err != nil {
-				//nolint:nakedret
-				return
-			}
-			username = cr.Config.Username
-			password = cr.Config.Password
-			passcredentialsall = cr.Config.PassCredentialsAll
-			insecureskiptlsverify = cr.Config.InsecureSkipTLSverify
-			caFile = cr.Config.CAFile
-			certFile = cr.Config.CertFile
-			keyFile = cr.Config.KeyFile
+	if cr := m.Repos.GetInfoByURL(repoURL); cr != nil {
+		var index *repo.IndexFile
+		index, err = m.Repos.GetIndex(cr.Name)
+		if err != nil {
+			return
+		}
+		var entry *repo.ChartVersion
+		entry, err = index.Get(name, version)
+		if err != nil {
+			// TODO: Where linting is skipped in this function we should
+			// refactor to remove naked returns while ensuring the same
+			// behavior
 			//nolint:nakedret
 			return
 		}
+		url, err = normalizeURL(repoURL, entry.URLs[0])
+		if err != nil {
+			//nolint:nakedret
+			return
+		}
+		username = cr.Username
+		password = cr.Password
+		passcredentialsall = cr.PassCredentialsAll
+		insecureskiptlsverify = cr.InsecureSkipTLSverify
+		caFile = cr.CAFile
+		certFile = cr.CertFile
+		keyFile = cr.KeyFile
+		//nolint:nakedret
+		return
 	}
 
 	urlsKey := repoURL + name + version
@@ -769,13 +741,9 @@ func (m *Manager) findChartURL(name, version, repoURL string, repos map[string]*
 // findEntryByName finds an entry in the chart repository whose name matches the given name.
 //
 // It returns the ChartVersions for that entry.
-func findEntryByName(name string, cr *repo.ChartRepository) (repo.ChartVersions, error) {
-	for ename, entry := range cr.IndexFile.Entries {
-		if ename == name {
-			return entry, nil
-		}
-	}
-	return nil, errors.New("entry not found")
+// TODO factor out
+func findEntryByName(name string, index *repo.IndexFile) (repo.ChartVersions, error) {
+	return index.GetVersions(name)
 }
 
 // findVersionedEntry takes a ChartVersions list and returns a single chart version that satisfies the version constraints.
@@ -826,35 +794,16 @@ func normalizeURL(baseURL, urlOrPath string) (string, error) {
 	return u2.String(), nil
 }
 
-// loadChartRepositories reads the repositories.yaml, and then builds a map of
-// ChartRepositories.
-//
-// The key is the local name (which is only present in the repositories.yaml).
-func (m *Manager) loadChartRepositories() (map[string]*repo.ChartRepository, error) {
-	indices := map[string]*repo.ChartRepository{}
-
-	// Load repositories.yaml file
-	rf, err := loadRepoConfig(m.RepositoryConfig)
+func (m *Manager) loadChartRepositories() error {
+	if m.Repos != nil {
+		return nil
+	}
+	repos, err := NewChartRepositories(m.RepositoryConfig, m.RepositoryCache)
 	if err != nil {
-		return indices, errors.Wrapf(err, "failed to load %s", m.RepositoryConfig)
+		return err
 	}
-
-	for _, re := range rf.Repositories {
-		lname := re.Name
-		idxFile := filepath.Join(m.RepositoryCache, helmpath.CacheIndexFile(lname))
-		index, err := repo.LoadIndexFile(idxFile)
-		if err != nil {
-			return indices, err
-		}
-
-		// TODO: use constructor
-		cr := &repo.ChartRepository{
-			Config:    re,
-			IndexFile: index,
-		}
-		indices[lname] = cr
-	}
-	return indices, nil
+	m.Repos = repos
+	return nil
 }
 
 // writeLock writes a lockfile to disk
